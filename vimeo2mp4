@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+
+set -e
+
+resolve_url_path() {
+  local url="$1"
+  local path="$2"
+
+  local levels="$(echo "${url}" | grep -Eo '/[^/]' | wc -l)" 
+  local parents="$(echo "${path}" | grep -Eo '\B\.\.\B' | wc -l)"
+
+  if (( parents > levels )); then
+    parents=$levels
+  fi
+
+  url="$(echo "${url}" | sed -E "s/(\/[^\/]+){$parents}\/[^\/]*$//")"
+  url="${url}/$(echo "${path}" | sed -E 's/\.\.\/?//g')"
+
+  echo "${url}"
+}
+
+select_best_video() {
+  echo "$1" | jq -r '.video | max_by(.width)'
+}
+
+select_best_audio() {
+  echo "$1" | jq -r '.audio | max_by(.bitrate)'
+}
+
+get_segments() {
+  local dest_dir="$1"
+  local base_url="$2"
+  local segments=$3
+
+  mkdir -p "${dest_dir}"
+
+  curl -s -C - -o "${dest_dir}/segment-0.mp4" "${base_url}/segment-0.mp4"
+  cp "${dest_dir}/segment-0.mp4" "${dest_dir}/combined.mp4"
+
+  local i
+  for (( i=1; i<=$segments; i++ )); do
+    curl -s -C - -o "${dest_dir}/segment-$i.m4s" "${base_url}/segment-$i.m4s"
+    cat "${dest_dir}/segment-$i.m4s" >> "${dest_dir}/combined.mp4"
+    echo "Getting segment $i done"
+  done
+}
+
+process() {
+  get_segments "${tmp_dir}/video" "${video_base_url}" $video_segments
+  echo "Getting video track done"
+  get_segments "${tmp_dir}/audio" "${audio_base_url}" $audio_segments
+  echo "Getting audio track done"
+  
+  ffmpeg \
+    -hide_banner -loglevel error \
+    -i "${tmp_dir}/video/combined.mp4" -i "${tmp_dir}/audio/combined.mp4" -c copy \
+    "${filename}"
+  echo "Bundling tracks done"
+
+  rm -rf "${tmp_dir}"
+  echo "Cleaning temp done"
+}
+
+main() {
+  local master_json_url="${1%\?*}"
+  local master_json="$(curl -s "${master_json_url}")"
+  local master_json_base_url="$(echo "${master_json}" | jq -r '.base_url')"
+
+  local clip_id="$(echo "${master_json}" | jq -r '.clip_id')"
+  local name="${clip_id}"
+  local tmp_dir=".${clip_id}"
+  local filename="${name}.mp4"
+
+  local base_url="$(resolve_url_path "${master_json_url}" "${master_json_base_url}")"
+
+  local video_json="$(select_best_video "${master_json}")"
+  local video_json_base_url="$(echo "${video_json}" | jq -r '.base_url')"
+  local video_base_url="$(resolve_url_path "${base_url}" "${video_json_base_url}")"
+  local video_segments=$(echo "${video_json}" | jq -r '.segments | length')
+
+  local audio_json="$(select_best_audio "${master_json}")"
+  local audio_json_base_url="$(echo "${audio_json}" | jq -r '.base_url')"
+  local audio_base_url="$(resolve_url_path "${base_url}" "${audio_json_base_url}")"
+  local audio_segments=$(echo "${audio_json}" | jq -r '.segments | length')
+
+  echo "Downloading video \"${name}\""
+
+  if which pv &>/dev/null; then
+    process |
+      # segments(n+1)*2 + converting(1) + cleaning(1)
+      pv -pe -ls $(( $video_segments + $audio_segments + 4)) >/dev/null
+  else
+    process
+  fi
+
+  echo "File saved to ${filename}"
+}
+
+main "$@"
